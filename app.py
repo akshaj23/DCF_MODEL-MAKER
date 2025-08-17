@@ -567,8 +567,17 @@ def alpha_table(model: str, inputs: dict, ke: float) -> Tuple[pd.DataFrame, floa
 # UI
 # ─────────────────────────────────────────────────────────────
 st.markdown("## 📊 DCF Valuation (SEC XBRL + Damodaran)")
-st.caption("Free SEC CompanyFacts (no API key). Build FCFF/WACC by the book. Country fixed: USA.")
+st.caption("""
+This tool fetches financial data from the SEC (10-K filings via the API), 
+benchmark assumptions from Professor Aswath Damodaran’s published datasets, 
+and market data from Yahoo Finance (via `yfinance`).  
+All data belongs to their respective providers.  
 
+This project is for educational purposes only — the models and valuations shown may be 
+incomplete, simplified, or inaccurate. No guarantee of correctness or investment advice 
+is implied. The SEC, Professor Damodaran, and Yahoo Finance are not affiliated with or 
+responsible for this project.
+""")
 # Lists
 try:
     tickers = load_tickers()
