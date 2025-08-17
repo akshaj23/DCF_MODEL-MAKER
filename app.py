@@ -84,6 +84,63 @@ def clamp(x, lo, hi):
     except Exception:
         return float(lo)
 
+# ---- Trailing-ratio helpers (new) ----
+def trailing_ratio(df_recent: pd.DataFrame, num_key: str, den_key: str, n: int = 3):
+    """Average of (num/den) over up to last n rows of histN (sorted desc by FY)."""
+    vals = []
+    rows = min(n, len(df_recent))
+    for i in range(rows):
+        num = nfloat(df_recent.iloc[i].get(num_key))
+        den = nfloat(df_recent.iloc[i].get(den_key))
+        if isnum(num) and isnum(den) and float(den) > 0:
+            vals.append(float(num) / float(den))
+    return float(np.nanmean(vals)) if vals else np.nan
+
+def trailing_nwc_sales(df_recent: pd.DataFrame, n: int = 3):
+    """Average of (CurrentAssets - CurrentLiabilities) / Revenue over up to last n rows."""
+    vals = []
+    rows = min(n, len(df_recent))
+    for i in range(rows):
+        ca  = nfloat(df_recent.iloc[i].get("CurrentAssets"))
+        cl  = nfloat(df_recent.iloc[i].get("CurrentLiabilities"))
+        rev = nfloat(df_recent.iloc[i].get("Revenue"))
+        if isnum(ca) and isnum(cl) and isnum(rev) and float(rev) > 0:
+            vals.append((float(ca) - float(cl)) / float(rev))
+    return float(np.nanmean(vals)) if vals else np.nan
+# -------------------------------------
+
+# ---- Operating-margin path from SEC trend (new) ----
+def build_op_margin_path(df_recent: pd.DataFrame, years: int, fallback: float):
+    """
+    Returns (marg_y0, path_for_years) using last ≤3 FY margins (OperatingIncome/Revenue).
+    If ≥2 points: linear trend per FY; else constant fallback.
+    """
+    pts = []
+    for i in range(min(3, len(df_recent))):
+        r  = nfloat(df_recent.iloc[i].get("Revenue"))
+        e  = nfloat(df_recent.iloc[i].get("OperatingIncome"))
+        fy = nfloat(df_recent.iloc[i].get("fy"))
+        if isnum(r) and r > 0 and isnum(e) and isnum(fy):
+            pts.append((int(fy), clamp(float(e)/float(r), 0.0, 0.60)))
+    pts = sorted(pts)  # ascending by FY
+
+    if pts:
+        m_latest = pts[-1][1]
+    else:
+        m_latest = float(fallback)
+
+    path = []
+    if len(pts) >= 2:
+        years_gap = (pts[-1][0] - pts[0][0]) or (len(pts)-1) or 1
+        slope = (pts[-1][1] - pts[0][1]) / years_gap
+        for t in range(1, int(years)+1):
+            path.append(clamp(m_latest + slope*t, 0.0, 0.60))
+    else:
+        path = [float(fallback)] * int(years)
+
+    return clamp(m_latest, 0.0, 0.60), path
+# ---------------------------------------------------
+
 # ─────────────────────────────────────────────────────────────
 # Tickers
 # ─────────────────────────────────────────────────────────────
@@ -383,7 +440,8 @@ def compute_wacc(rf, erp, beta, kd, debt_wt, tax_rate):
     return float(max(wacc, 0.0001)), float(ke), float(kd)
 
 def run_fcff_dcf(revenue, op_margin, dep_pct, capex_pct, nwc_pct,
-                 growth, years, terminal_g, tax_rate, wacc, shares, net_debt):
+                 growth, years, terminal_g, tax_rate, wacc, shares, net_debt,
+                 op_margin_path=None):  # ← NEW optional
     wacc = float(max(wacc, float(terminal_g) + EPS))
     shares = float(max(nfloat(shares) or 0.0, 1.0))
     net_debt = float(nfloat(net_debt) or 0.0)
@@ -394,7 +452,10 @@ def run_fcff_dcf(revenue, op_margin, dep_pct, capex_pct, nwc_pct,
     prev_wc = sales * float(nwc_pct)
     for t in range(1, int(years)+1):
         sales *= (1 + float(growth))
-        ebit  = sales * float(op_margin)
+        om = (float(op_margin_path[t-1]) if isinstance(op_margin_path, (list, tuple))
+              and t-1 < len(op_margin_path) and isnum(op_margin_path[t-1])
+              else float(op_margin))                                    # per-year margin
+        ebit  = sales * om
         nopat = ebit * (1 - float(tax_rate))
         dep   = sales * float(dep_pct)
         capex = sales * float(capex_pct)
@@ -505,16 +566,17 @@ def alpha_table(model: str, inputs: dict, ke: float) -> Tuple[pd.DataFrame, floa
     capex_pct = inputs["capex_pct"]
     if model == "firm_fcff_nocapex":
         capex_pct = 0.0
+
     df, tv, pv_tv, ev, eq, price = run_fcff_dcf(
         revenue=inputs["revenue"], op_margin=inputs["op_margin"],
         dep_pct=inputs["dep_pct"], capex_pct=capex_pct, nwc_pct=inputs["nwc_pct"],
         growth=inputs["growth"], years=inputs["years"], terminal_g=inputs["terminal_g"],
         tax_rate=inputs["tax_rate"], wacc=inputs["wacc"], shares=inputs["shares"],
-        net_debt=inputs["net_debt"]
+        net_debt=inputs["net_debt"], op_margin_path=inputs.get("op_margin_path")  # ← NEW
     )
     yrs = ["Year 0"] + [f"Year {int(y)}" for y in df["Year"]] + ["Terminal"]
     rev0    = inputs["revenue"]
-    marg0   = inputs["op_margin"]
+    marg0   = inputs.get("op_margin_y0", inputs["op_margin"])  # ← NEW
     ebit0   = rev0 * marg0
     taxes0  = - ebit0 * inputs["tax_rate"]
     nopat0  = ebit0 * (1 - inputs["tax_rate"])
@@ -524,7 +586,9 @@ def alpha_table(model: str, inputs: dict, ke: float) -> Tuple[pd.DataFrame, floa
     fcff0   = nopat0 + dep0 - capex0 - dnwk0
 
     rev      = [rev0] + list(df["Sales"]) + [np.nan]
-    margin   = [marg0] + [inputs["op_margin"]]*len(df) + [np.nan]
+    # show the margin series actually used
+    used_margin = (list(inputs.get("op_margin_path", [])) if inputs.get("op_margin_path") else [inputs["op_margin"]]*len(df))
+    margin   = [marg0] + used_margin + [np.nan]  # ← NEW
     ebit     = [ebit0] + list(df["EBIT"]) + [np.nan]
     taxes    = [taxes0] + list(-(df["EBIT"]*inputs["tax_rate"])) + [np.nan]
     nopat    = [nopat0] + list(df["NOPAT"]) + [np.nan]
@@ -656,48 +720,105 @@ for c in hist_show.columns:
     hist_show[c] = hist_show[c].map(human_inline)
 st.dataframe(hist_show.rename(columns={"fy":"FY"}).set_index("FY"), use_container_width=True)
 
-# Defaults & sources
+# Defaults & sources (now: SEC 3Y averages → last FY → Damodaran)
 defaults = fuzzy_defaults(sel_ind, ind_map)
 rf, erp, g_cap = us_defaults["rf"], us_defaults["erp"], us_defaults["g_cap"]
+
+op_margin_3y = trailing_ratio(histN, "OperatingIncome", "Revenue", 3)
+net_margin_3y = trailing_ratio(histN, "NetIncome", "Revenue", 3)
+dep_pct_3y    = trailing_ratio(histN, "DepAmort", "Revenue", 3)
+capex_pct_3y  = trailing_ratio(histN, "CapEx", "Revenue", 3)
+nwc_pct_3y    = trailing_nwc_sales(histN, 3)
 
 last_row = histN.iloc[0]
 rev_last   = nfloat(last_row.get("Revenue"))
 ebit_last  = nfloat(last_row.get("OperatingIncome"))
 ni_last    = nfloat(last_row.get("NetIncome"))
+dep_last   = nfloat(last_row.get("DepAmort"))
+cap_last   = nfloat(last_row.get("CapEx"))
 
-op_margin_from_sec  = isnum(rev_last) and isnum(ebit_last) and rev_last>0
-net_margin_from_sec = isnum(rev_last) and isnum(ni_last)  and rev_last>0
+def _pick_ratio(trailing_val, last_num, last_den, damo, lo, hi):
+    if isnum(trailing_val):
+        return clamp(trailing_val, lo, hi)
+    if isnum(last_num) and isnum(last_den) and float(last_den) > 0:
+        return clamp(float(last_num)/float(last_den), lo, hi)
+    return clamp(nfloat(damo), lo, hi)
 
-op_margin_pref  = clamp(ebit_last/rev_last, 0.03, 0.60) if op_margin_from_sec  else nfloat(defaults["op_margin"])
-net_margin_pref = clamp(ni_last/rev_last,  0.00, 0.50) if net_margin_from_sec else nfloat(defaults["net_margin"])
+op_margin_pref  = _pick_ratio(op_margin_3y, ebit_last, rev_last, defaults["op_margin"], 0.00, 0.60)
+net_margin_pref = _pick_ratio(net_margin_3y,  ni_last,  rev_last, defaults["net_margin"], 0.00, 0.50)
+dep_pct_pref    = _pick_ratio(dep_pct_3y,    dep_last, rev_last, defaults["dep_sales"], 0.00, 0.20)
+capex_pct_pref  = _pick_ratio(capex_pct_3y,  cap_last, rev_last, defaults["capex_sales"], 0.00, 0.25)
 
-dep_last = nfloat(last_row.get("DepAmort"))
-dep_from_sec = isnum(dep_last) and isnum(rev_last) and rev_last>0
-dep_pct_pref = clamp(dep_last/rev_last, 0.00, 0.20) if dep_from_sec else nfloat(defaults["dep_sales"])
+nwc_pct_pref = float(nwc_pct_3y) if isnum(nwc_pct_3y) else float(nfloat(defaults["nwc_sales"]) or 0.03)
 
-cap_last = nfloat(last_row.get("CapEx"))
-capex_from_sec = isnum(cap_last) and isnum(rev_last) and rev_last>0
-capex_pct_pref = clamp(cap_last/rev_last, 0.00, 0.25) if capex_from_sec else nfloat(defaults["capex_sales"])
+op_margin_from_sec  = isnum(op_margin_3y)  or (isnum(ebit_last) and isnum(rev_last))
+net_margin_from_sec = isnum(net_margin_3y) or (isnum(ni_last)  and isnum(rev_last))
+dep_from_sec        = isnum(dep_pct_3y)    or (isnum(dep_last) and isnum(rev_last))
+capex_from_sec      = isnum(capex_pct_3y)  or (isnum(cap_last) and isnum(rev_last))
+nwc_from_sec        = isnum(nwc_pct_3y)
 
-nwc_pct_pref = nfloat(defaults["nwc_sales"]) if isnum(defaults["nwc_sales"]) else 0.03
-
-# Growth guess
+# Growth guess: 3Y CAGR (fallback to 1Y/5%)
 try:
-    if len(histN) >= 2 and isnum(histN["Revenue"].iloc[1]) and histN["Revenue"].iloc[1] > 0:
-        yrs_gap = (histN["fy"].iloc[0] - histN["fy"].iloc[1]) or 1
-        cagr = (histN["Revenue"].iloc[0] / histN["Revenue"].iloc[1]) ** (1/yrs_gap) - 1
+    rev_series = histN["Revenue"].dropna().astype(float).head(3)
+    fy_series  = histN["fy"].head(len(rev_series))
+    if len(rev_series) >= 2:
+        newest = float(rev_series.iloc[0])
+        oldest = float(rev_series.iloc[-1])
+        years_gap = int(abs(int(fy_series.iloc[0]) - int(fy_series.iloc[-1]))) or (len(rev_series)-1) or 1
+        cagr = (newest/oldest)**(1/years_gap) - 1 if oldest > 0 else np.nan
     else:
-        cagr = 0.05
-    growth_pref = clamp(cagr, 0.00, 0.20)
+        cagr = np.nan
+    growth_pref = clamp(cagr if isnum(cagr) else 0.05, 0.00, 0.20)
 except Exception:
     growth_pref = 0.05
 
-# Cost of debt
-kd_pref = 0.065
+# ── DERIVED: kd (SEC/Proxy), tax rate (SEC), debt weight (SEC+Yahoo)
+# Cost of debt + Tax rate + Debt weight (all derived; still editable above)
+
+# --- kd (SEC InterestExp / TotalDebt; fallback Damodaran-style proxy rf+2%) ---
 interest = nfloat(last_row.get("InterestExp"))
-debt_avg = nfloat(latest.get("total_debt"))
-if isnum(interest) and isnum(debt_avg) and debt_avg>0:
-    kd_pref = clamp(abs(interest)/debt_avg, 0.02, 0.12)
+total_debt_latest = nfloat(latest.get("total_debt"))
+kd_proxy = clamp(us_defaults["rf"] + 0.02, 0.02, 0.12)  # simple US proxy
+kd_from_sec = (abs(interest) / total_debt_latest) if (isnum(interest) and isnum(total_debt_latest) and total_debt_latest > 0) else np.nan
+kd_pref = clamp(kd_from_sec, 0.02, 0.12) if isnum(kd_from_sec) else kd_proxy
+src_kd = ("SEC (InterestExp / Total Debt; editable above)"
+          if isnum(kd_from_sec)
+          else f"Damodaran proxy (rf + 2%; rf {us_defaults['rf']:.2%}; editable above)")
+
+# --- Tax rate (SEC effective: IncomeTaxExpense / PretaxIncome; fallback US 21%) ---
+def _latest_val(tags):
+    for t in tags:
+        df = get_fact(sec, t, ("USD",))
+        if df.empty:
+            continue
+        dfa = pick_annual(df)
+        s = pd.to_numeric(dfa.sort_values("fy", ascending=False)["val"], errors="coerce").dropna()
+        if len(s):
+            return float(s.iloc[0])
+    return np.nan
+
+tax_exp = _latest_val([
+    "IncomeTaxExpenseBenefit",
+    "IncomeTaxExpense",
+    "IncomeTaxExpenseBenefitContinuingOperations",
+])
+pretax  = _latest_val([
+    "IncomeBeforeIncomeTaxes",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    "PretaxIncomeLoss",
+])
+
+tax_eff = (tax_exp / pretax) if (isnum(tax_exp) and isnum(pretax) and pretax > 0) else np.nan
+tax_rate_pref = clamp(tax_eff, 0.00, 0.40) if isnum(tax_eff) else 0.21
+src_tax = ("SEC (Income tax / Pretax income; editable above)"
+           if isnum(tax_eff) else "US statutory (21%; editable above)")
+
+# --- Debt weight wd (SEC + Yahoo: Debt / (Debt + Market Cap); fallback 20%) ---
+wd_from_data = (total_debt_latest / (total_debt_latest + mkt_cap)) \
+    if (isnum(total_debt_latest) and isnum(mkt_cap) and (total_debt_latest + mkt_cap) > 0) else np.nan
+debt_wt_pref = clamp(wd_from_data, 0.0, 0.70) if isnum(wd_from_data) else 0.20
+src_wd = ("SEC + Yahoo (Debt / (Debt + Market Cap); editable above)"
+          if isnum(wd_from_data) else "Fallback (industry/heuristic 20%; editable above)")
 
 shares_source = "SEC" if isnum(shares_sec) else ("Yahoo" if isnum(shares_yf) else "User")
 shares_pref = float(nfloat(shares_sec) or nfloat(shares_yf) or 1_000_000_000.0)
@@ -717,7 +838,7 @@ with c2a:
 with c3a:
     net_debt= st.number_input("Net Debt (Debt − Cash)", value=net_debt_pref, step=1e6, format="%.0f")
 with c4a:
-    tax_rate= st.slider("Tax Rate", 0.00, 0.40, 0.21, 0.005)
+    tax_rate= st.slider("Tax Rate", 0.00, 0.40, float(tax_rate_pref), 0.005)
 
 c5,c6,c7,c8 = st.columns(4)
 with c5: op_margin  = st.slider("Operating Margin (EBIT/Sales)", 0.00, 0.60, float(op_margin_pref if isnum(op_margin_pref) else 0.12), 0.005)
@@ -732,11 +853,14 @@ with c11: terminal_g = st.slider("Terminal Growth (≤ long-run cap)", 0.00, flo
 
 c12,c13,c14 = st.columns(3)
 with c12: beta    = st.slider("Levered Beta (industry)", 0.40, 2.50, float(fuzzy_defaults(sel_ind, ind_map)["beta"]), 0.01)
-with c13: debt_wt = st.slider("Debt Weight (WACC)", 0.0, 0.70, 0.20, 0.01)
+with c13: debt_wt = st.slider("Debt Weight (WACC)", 0.0, 0.70, float(debt_wt_pref), 0.01)
 with c14: kd      = st.slider("Pretax Cost of Debt", 0.01, 0.15, float(kd_pref), 0.001)
 
 wacc, ke, kd_eff = compute_wacc(us_defaults["rf"], us_defaults["erp"], beta, kd, debt_wt, tax_rate)
 st.caption(f"WACC **{wacc:.2%}** • Ke **{ke:.2%}**  |  rf {us_defaults['rf']:.2%}, ERP {us_defaults['erp']:.2%}, β {beta:.2f}")
+
+# Build operating-margin path (SEC trend; fallback to slider)
+op_margin_y0, op_margin_path = build_op_margin_path(histN, years, op_margin)
 
 # Assumptions & Sources (single explicit source)
 ass_rows = [
@@ -745,7 +869,7 @@ ass_rows = [
     ("Net margin", net_margin, ("SEC" if net_margin_from_sec else "Damodaran"), "us-gaap:NetIncomeLoss"),
     ("Depreciation / Sales", dep_pct, ("SEC" if dep_from_sec else "Damodaran"), "us-gaap:DepreciationAndAmortization"),
     ("CapEx / Sales", capex_pct, ("SEC" if capex_from_sec else "Damodaran"), "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment"),
-    ("NWC / Sales", nwc_pct_pref, "Damodaran", "Damodaran WC % of Sales"),
+    ("NWC / Sales", nwc_pct_pref, ("SEC" if nwc_from_sec else "Damodaran"), "CA−CL over Sales (3Y avg if SEC)"),
     ("Tax rate", tax_rate, "User", ""),
     ("β (levered)", beta, "Damodaran",""),
     ("Debt weight", debt_wt, "User",""),
@@ -765,7 +889,7 @@ company_sources = {
     "Net margin": "SEC" if net_margin_from_sec else "Damodaran",
     "Dep / Sales": "SEC" if dep_from_sec else "Damodaran",
     "CapEx / Sales":"SEC" if capex_from_sec else "Damodaran",
-    "NWC / Sales":"Damodaran",
+    "NWC / Sales": "SEC" if nwc_from_sec else "Damodaran",
     "β (levered)":"Damodaran",
 }
 bench = pd.DataFrame(
@@ -793,7 +917,8 @@ base_inputs = dict(
     revenue=revenue, op_margin=op_margin, net_margin=net_margin,
     dep_pct=dep_pct, capex_pct=capex_pct, nwc_pct=nwc_pct_pref,
     growth=growth, years=years, terminal_g=terminal_g, tax_rate=tax_rate,
-    wacc=wacc, shares=shares, net_debt=net_debt
+    wacc=wacc, shares=shares, net_debt=net_debt,
+    op_margin_path=op_margin_path, op_margin_y0=op_margin_y0  # ← NEW
 )
 
 def show_results_alpha(model: str, inputs: dict, scenario_label: str):
@@ -899,7 +1024,7 @@ def show_results_alpha(model: str, inputs: dict, scenario_label: str):
             "FCFE (B)": df["FCFE"]/1e9
         }).melt("Year", var_name="Series", value_name="USD (Billions)"))
     else:
-        df, *_ = run_fcff_dcf(inputs["revenue"], inputs["op_margin"], inputs["dep_pct"], (0.0 if model=="firm_fcff_nocapex" else inputs["capex_pct"]), inputs["nwc_pct"], inputs["growth"], inputs["years"], inputs["terminal_g"], inputs["tax_rate"], inputs["wacc"], inputs["shares"], inputs["net_debt"])
+        df, *_ = run_fcff_dcf(inputs["revenue"], inputs["op_margin"], inputs["dep_pct"], (0.0 if model=="firm_fcff_nocapex" else inputs["capex_pct"]), inputs["nwc_pct"], inputs["growth"], inputs["years"], inputs["terminal_g"], inputs["tax_rate"], inputs["wacc"], inputs["shares"], inputs["net_debt"], op_margin_path=inputs.get("op_margin_path"))  # ← pass path for chart
         ch = (pd.DataFrame({
             "Year": df["Year"],
             "Revenue (B)": df["Sales"]/1e9,
@@ -936,6 +1061,85 @@ if st.session_state.ran:
         "Firm Model: via FCFF, w/o CapEx":"firm_fcff_nocapex",
     }
     model = MODEL_MAP[model_label]
+
+    # NEW: Discount rate — sources & workings
+    with st.expander("Discount rate — sources & workings"):
+        we = 1 - float(debt_wt)
+        kd_after_tax = float(kd) * (1 - float(tax_rate))
+        st.markdown(
+            "- **Ke = rf + β × ERP**  \n"
+            "- **WACC = we × Ke + wd × kd × (1 − Tax)**"
+        )
+        df_disc = pd.DataFrame([
+            ("Risk-free rate (rf)",       f"{us_defaults['rf']:.2%}",  "Damodaran (US; editable above)"),
+            ("Equity risk premium (ERP)", f"{us_defaults['erp']:.2%}", "Damodaran (US; editable above)"),
+            ("Beta (levered)",            f"{beta:.2f}",               "Damodaran industry (editable above)"),
+            ("Cost of equity (Ke)",       f"{(us_defaults['rf'] + beta*us_defaults['erp']):.2%}", "Derived: rf + β×ERP"),
+            ("Pre-tax cost of debt (kd)", f"{kd:.2%}",                 src_kd),
+            ("Tax rate",                  f"{tax_rate:.2%}",           src_tax),
+            ("Debt weight (wd)",          f"{debt_wt:.2%}",            src_wd),
+            ("Equity weight (we)",        f"{we:.2%}",                 "Derived"),
+            ("After-tax kd",              f"{kd_after_tax:.2%}",       "kd × (1 − Tax)"),
+            ("WACC",                      f"{wacc:.2%}",               "Derived"),
+        ], columns=["Item","Value","Source"])
+        st.dataframe(df_disc, use_container_width=True)
+
+    # Revenue growth — sources & workings
+    with st.expander("Revenue growth — sources & workings"):
+        # Use last up-to-3 FYs for CAGR
+        _rev = histN[["fy","Revenue"]].dropna().astype({"Revenue": float}).head(3)
+        if len(_rev) >= 2:
+            newest_rev = float(_rev.iloc[0]["Revenue"])
+            oldest_rev = float(_rev.iloc[-1]["Revenue"])
+            newest_fy  = int(_rev.iloc[0]["fy"])
+            oldest_fy  = int(_rev.iloc[-1]["fy"])
+            years_gap  = max(1, abs(newest_fy - oldest_fy))
+            cagr_calc  = (newest_rev/oldest_rev)**(1/years_gap) - 1 if oldest_rev > 0 else np.nan
+        else:
+            newest_rev = oldest_rev = np.nan
+            newest_fy = oldest_fy = np.nan
+            cagr_calc = np.nan
+
+        chosen_growth = growth  # slider (editable above)
+        df_growth = pd.DataFrame([
+            (f"Revenue FY-{oldest_fy if isnum(oldest_fy) else 'old'}", human(oldest_rev), "SEC"),
+            (f"Revenue FY-{newest_fy if isnum(newest_fy) else 'new'}", human(newest_rev), "SEC"),
+            ("CAGR (3Y or available)", f"{(cagr_calc if isnum(cagr_calc) else np.nan):.2%}" if isnum(cagr_calc) else "—", "Derived: CAGR(new/old)"),
+            ("Fallback (if no data)",  f"{0.05:.2%}", "Damodaran default"),
+            ("Chosen Growth",          f"{chosen_growth:.2%}", "Derived (CAGR; editable above)"),
+        ], columns=["Item","Value","Source"])
+        st.dataframe(df_growth, use_container_width=True)
+
+    # Operating margin — sources & workings
+    with st.expander("Operating margin — sources & workings"):
+        # Last 3 FY EBIT/Sales
+        rows = []
+        labels = ["FY-1 (latest)", "FY-2", "FY-3"]
+        for i, lab in zip(range(0, min(3, len(histN))), labels):
+            r = nfloat(histN.iloc[i].get("Revenue"))
+            e = nfloat(histN.iloc[i].get("OperatingIncome"))
+            m = (e / r) if (isnum(e) and isnum(r) and r > 0) else np.nan
+            rows.append((f"EBIT / Revenue {lab}", f"{m:.2%}" if isnum(m) else "—", "SEC"))
+
+        # 3Y average and fallback
+        m_series = []
+        for i in range(0, min(3, len(histN))):
+            r = nfloat(histN.iloc[i].get("Revenue"))
+            e = nfloat(histN.iloc[i].get("OperatingIncome"))
+            if isnum(e) and isnum(r) and r > 0:
+                m_series.append(e / r)
+        m_avg = float(np.nanmean(m_series)) if len(m_series) else np.nan
+        chosen_margin = op_margin  # slider (editable above)
+
+        df_margin = pd.DataFrame(
+            rows + [
+                ("3Y Avg", f"{m_avg:.2%}" if isnum(m_avg) else "—", "Derived"),
+                ("Fallback (if no SEC)", f"{defaults['op_margin']:.2%}", "Damodaran default"),
+                ("Chosen Margin", f"{chosen_margin:.2%}", "Derived (avg; editable above)"),
+            ],
+            columns=["Item","Value","Source"]
+        )
+        st.dataframe(df_margin, use_container_width=True)
 
     cons = {**base_inputs, "growth":max(0.00, base_inputs["growth"]-0.02)}
     base = {**base_inputs}
